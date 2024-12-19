@@ -4,6 +4,9 @@
 #include <thread>
 #include <boost/asio.hpp>
 #include <boost/bind/bind.hpp>
+#include <vector>
+#include <regex>
+#include <algorithm>
 
 #pragma comment(lib, "ws2_32.lib")
 
@@ -17,6 +20,83 @@ static std::unique_ptr<boost::asio::ip::tcp::resolver> resolverPtr;
 static std::thread ioThread;
 static bool stopIo = false;
 static std::unique_ptr<boost::asio::io_service::work> keepWork; // Объект для "удержания" io_service живым
+
+enum DomainErrorType {
+    MISSING_TOP_LEVEL_DOMAIN,
+    INVALID_CHARACTERS,
+    EMPTY_OR_SPACES,
+    INVALID_LENGTH,
+    UNSUPPORTED_CHARACTERS,
+    OTHER_ERRORS
+};
+
+// Описание ошибок
+const char* DomainErrorDescriptions[] = {
+    "Отсутствует домен верхнего уровня.",            // MISSING_TOP_LEVEL_DOMAIN
+    "Используются недопустимые символы.",           // INVALID_CHARACTERS
+    "Домен пустой или содержит только пробелы.",    // EMPTY_OR_SPACES
+    "Неверная длина домена.",                       // INVALID_LENGTH
+    "Неподдерживаемые символы для punycode.",       // UNSUPPORTED_CHARACTERS
+    "Другие ошибки, связанные с доменом."            // OTHER_ERRORS
+};
+
+// Проверка домена
+std::vector<DomainErrorType> validateDomain(const std::string& domain) {
+    std::vector<DomainErrorType> errors;
+
+    // Удаляем начальные и конечные пробелы
+    std::string trimmedDomain = domain;
+    trimmedDomain.erase(0, trimmedDomain.find_first_not_of(" \t"));
+    trimmedDomain.erase(trimmedDomain.find_last_not_of(" \t") + 1);
+
+    // Категория (c): Проверка на пустую строку
+    if (trimmedDomain.empty()) {
+        errors.push_back(EMPTY_OR_SPACES);
+        return errors;
+    }
+
+    // Категория (d): Проверка длины домена
+    if (trimmedDomain.length() < 3 || trimmedDomain.length() > 253) {
+        errors.push_back(INVALID_LENGTH);
+    }
+
+    // Категория (b): Проверка недопустимых символов
+    std::regex invalidCharsRegex("[^a-zA-Z0-9.-]");
+    if (std::regex_search(trimmedDomain, invalidCharsRegex)) {
+        errors.push_back(INVALID_CHARACTERS);
+    }
+
+    // Категория (a): Проверка на наличие домена верхнего уровня
+    if (trimmedDomain.find('.') == std::string::npos ||
+        trimmedDomain.back() == '.') {
+        errors.push_back(MISSING_TOP_LEVEL_DOMAIN);
+    }
+
+    // Категория (e): Проверка символов, неподдерживаемых punycode
+    if (!std::all_of(trimmedDomain.begin(), trimmedDomain.end(), [](unsigned char c) {
+        return (c >= 32 && c <= 126); // Допустимые символы ASCII
+        })) {
+        errors.push_back(UNSUPPORTED_CHARACTERS);
+    }
+
+    // Категория (f): Другие ошибки (например, проверка на "..")
+    if (trimmedDomain.find("..") != std::string::npos) {
+        errors.push_back(OTHER_ERRORS);
+    }
+
+    return errors;
+}
+
+
+// Вывод ошибок
+std::string getErrorMessages(const std::vector<DomainErrorType>& errors) {
+    std::string errorMessages;
+    for (const auto& error : errors) {
+        errorMessages += DomainErrorDescriptions[error];
+        errorMessages += "\n";
+    }
+    return errorMessages.empty() ? "No errors found." : errorMessages;
+}
 
 void handle_resolve(const boost::system::error_code& err,
     boost::asio::ip::tcp::resolver::iterator endpoint_iterator)
@@ -80,6 +160,15 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
             GetWindowTextA(hEditDomain, domain, 256);
             std::string host = domain;
             if (!host.empty()) {
+                // Вызываем валидацию домена
+                std::vector<DomainErrorType> errors = validateDomain(host);
+                if (!errors.empty()) {
+                    // Если есть ошибки, выводим их в окно для IP
+                    SetWindowTextA(hStaticIP, getErrorMessages(errors).c_str());
+                    return 0;
+                }
+
+                // Если ошибок нет, начинаем процесс разрешения домена
                 SetWindowTextA(hStaticIP, "Resolving...");
                 io_service.post([host]() {
                     start_resolve(host);
@@ -88,6 +177,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
             else {
                 SetWindowTextA(hStaticIP, "Please enter a domain.");
             }
+
         }
     }
     break;
@@ -120,8 +210,11 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow)
         return 0;
     }
 
-    HWND hwnd = CreateWindowExA(0, "DnsWindowClass", "DNS Resolver",
-        WS_OVERLAPPEDWINDOW,
+    HWND hwnd = CreateWindowExA(
+        0,
+        "DnsWindowClass",
+        "DNS Resolver",
+        WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX, // Новый стиль окна
         CW_USEDEFAULT, CW_USEDEFAULT, 420, 300,
         NULL, NULL, hInstance, NULL);
 
@@ -133,22 +226,20 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow)
     ShowWindow(hwnd, nCmdShow);
     UpdateWindow(hwnd);
 
-    // Создаём работу, чтобы io_service.run() не завершался сразу
     keepWork = std::make_unique<boost::asio::io_service::work>(io_service);
-
     ioThread = std::thread([]() {
         io_service.run();
         });
-
+    // Основной цикл сообщений
     MSG Msg;
     while (GetMessageA(&Msg, NULL, 0, 0) > 0) {
         TranslateMessage(&Msg);
         DispatchMessageA(&Msg);
     }
-
     io_service.stop();
-    if (ioThread.joinable())
+    if (ioThread.joinable()) {
         ioThread.join();
+    }
 
     return (int)Msg.wParam;
 }
